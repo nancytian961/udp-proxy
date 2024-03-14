@@ -96,8 +96,7 @@ static int qc_proxy_parse_conf(int argc, char**argv)
         handle_parser = &globle_conf_parser[c];
         if (handle_parser->parser == NULL){
             printf("%s\n", handle_parser->help_msg);
-            if(c=='h')
-            {
+            if (c=='h') {
                 for(i = 0; i<ARRAY_SIZE(options); i++)
                     printf("%s", options[i]);
             }
@@ -106,8 +105,8 @@ static int qc_proxy_parse_conf(int argc, char**argv)
         handle_parser->parser(&qproxy_conf, optarg);
 
     }//end while
-    printf("Listener %s %s:%d\n", (qproxy_conf.lip_type ? "ipv6" : "ipv4"), qproxy_conf.listen_ip, qproxy_conf.listen_port);
-    printf("Server   %s %s:%d\n", (qproxy_conf.sip_type ? "ipv6" : "ipv4"), qproxy_conf.server_ip, qproxy_conf.server_port);
+    printf("Listener %s [%s]:[%d]\n", (qproxy_conf.lip_type ? "ipv6" : "ipv4"), qproxy_conf.listen_ip, qproxy_conf.listen_port);
+    printf("Server   %s [%s]:[%d]\n", (qproxy_conf.sip_type ? "ipv6" : "ipv4"), qproxy_conf.server_ip, qproxy_conf.server_port);
 
     return 0;
 }
@@ -172,36 +171,72 @@ static void qc_proxy_free(msg_t *msg, int efd)
 
 
 // Set port and IP:
-static void qc_proxy_set_addr(struct sockaddr_in *addr, int listen)
+static void qc_proxy_set_addr(void *addr, int listen)
 {
-    addr->sin_family = AF_INET;
-    if (listen) {
-        addr->sin_port = htons(qproxy_conf.listen_port);
-        addr->sin_addr.s_addr = inet_addr(qproxy_conf.listen_ip);
-    } else {
-        addr->sin_port = htons(qproxy_conf.server_port);
-        addr->sin_addr.s_addr = inet_addr(qproxy_conf.server_ip);
-    }
+	addr_info *dst = (addr_info*)addr;
+	if (listen) {
+		if (qproxy_conf.lip_type == 0) {
+			dst->is_ipv6 = 0;
+			struct sockaddr_in *in4 = &dst->u.in4;
+			in4->sin_family = AF_INET;
+			in4->sin_port = htons(qproxy_conf.listen_port);
+			in4->sin_addr.s_addr = inet_addr(qproxy_conf.listen_ip);
+		} else{
+			dst->is_ipv6 = 1;
+			struct sockaddr_in6 *in6 = &dst->u.in6; 
+			in6->sin6_family = AF_INET6;
+			in6->sin6_port = htons(qproxy_conf.listen_port);
+			inet_pton(AF_INET6, qproxy_conf.listen_ip, &in6->sin6_addr);
+		}
+		sprintf(dst->str, "[%s]:[%d] \n", qproxy_conf.listen_ip, qproxy_conf.listen_port);
+	} else {
+		if (qproxy_conf.sip_type == 0) {
+			dst->is_ipv6 = 0;
+			struct sockaddr_in *in4 = &dst->u.in4;
+			in4->sin_family = AF_INET;
+			in4->sin_port = htons(qproxy_conf.server_port);
+			in4->sin_addr.s_addr = inet_addr(qproxy_conf.server_ip);
+		}
+		else {
+			dst->is_ipv6 = 1;
+			struct sockaddr_in6 *in6 = &dst->u.in6; 
+			in6->sin6_family = AF_INET6;
+			in6->sin6_port = htons(qproxy_conf.server_port);
+			inet_pton(AF_INET6, qproxy_conf.server_ip, &in6->sin6_addr);
+		}
 
-    return;
+		sprintf(dst->str, "[%s]:[%d] \n",qproxy_conf.server_ip, qproxy_conf.server_port);
+	}
+
+	return;
 }
 
 int qc_proxy_listen_create()
 {
     int sockfd = -1;
     int sockopt = 1;
-    struct sockaddr_in bind_addr;
+	int addr_len = 0;
+	struct sockaddr *bind_addr;
 
-    // new socket
-    sockfd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if(sockfd < 0){
-        printf("Err: creating listen socket failed\n");
-        return -1;
-    }
+	addr_info laddr;
+	qc_proxy_set_addr(&laddr, LISTEN_ADDR);
+
+	if (qproxy_conf.lip_type)	{
+		sockfd = socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP);
+		addr_len = sizeof(laddr.u.in6);
+		bind_addr = (struct sockaddr*)&laddr.u.in6;
+	}
+	else{
+		sockfd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+		addr_len = sizeof(laddr.u.in4);
+		bind_addr = (struct sockaddr*)&laddr.u.in4;
+	}
+	if(sockfd < 0){
+		printf("Err: creating listen socket failed\n");
+		return -1;
+	}
     printf("Info: creating listen socket %d successfully\n", sockfd);
 
-    /*set ip/port */
-    qc_proxy_set_addr(&bind_addr, LISTEN_ADDR);
 
     if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR,
                &sockopt, sizeof(sockopt)))
@@ -220,7 +255,7 @@ int qc_proxy_listen_create()
     }
 
     /*bind*/
-    if (bind(sockfd, (struct sockaddr*)&bind_addr, sizeof(bind_addr)) < 0) {
+    if (bind(sockfd, bind_addr, addr_len) < 0) {
         printf("Err: bind to the addr %s:%d failed\n", qproxy_conf.listen_ip, qproxy_conf.listen_port);
         return -1;
     }
@@ -231,46 +266,75 @@ int qc_proxy_listen_create()
 
 int qc_proxy_recv_from_lfd(int fd, int efd, msg_t** r_msg)
 { 
-    struct sockaddr_in src_addr;
-    struct sockaddr_in dst_addr;
-    int client_struct_length = sizeof(src_addr);
+    struct sockaddr_in src_in4;
+    struct sockaddr_in6 src_in6;
+    struct sockaddr *src_addr;
+    struct sockaddr *dst_addr;
+
+    int addr_len = 0;
     int cfd;
     int one_flag = 1;
 
     msg_t *msg;
     sess_t *sess;
-    conn_t *conn;
+	conn_t *f;
 
-    msg = malloc(sizeof(msg_t));
-    if (!msg) {
-        printf("Err: creating msg_t failed \n");
-        return -1;
-    }
+	msg = malloc(sizeof(msg_t));
+	if (!msg) {
+		printf("Err: creating msg_t failed \n");
+		return -1;
+	}
 
     nalloc_msg++;
-    memset(msg->data, '\0', MSG_DATA_SIZE);
+	memset(msg->data, '\0', MSG_DATA_SIZE);
 
-    //read data on listen fd
-    msg->len = recvfrom(fd, msg->data, sizeof(msg->data), 0,
-         (struct sockaddr*)&src_addr, &client_struct_length);
-    if (msg->len < 0) {
-        printf("Err: read data on listen fd failed.\n");
-        return -1;
-    }
-    printf("Info: a new QC connection from %s:%d\n",
-           inet_ntoa(src_addr.sin_addr), ntohs(src_addr.sin_port));
+	/*alloc session*/
+	sess = malloc(sizeof(sess_t));
+	f = &sess->front;
+    f->sess = sess;
+	qc_proxy_set_addr(&f->me, LISTEN_ADDR);
 
-    qc_proxy_set_addr(&dst_addr, LISTEN_ADDR);
+	if (f->me.is_ipv6) {
+		cfd = socket(AF_INET6, SOCK_DGRAM, 0);
+		addr_len = sizeof(struct sockaddr_in6);
+		msg->len = recvfrom(fd, msg->data, sizeof(msg->data), 0,
+				(struct sockaddr*)&src_in6, &addr_len);
+		dst_addr = (struct sockaddr*)&f->me.u.in6;
+		src_addr = (struct sockaddr*)&src_in6;
+		memcpy(&f->peer.u.in6, &src_in6, sizeof(src_in6));
+		f->peer.is_ipv6 = 1;
+		char ip_str[40] = {0};
+		inet_ntop(AF_INET6, &(src_in6), ip_str, sizeof(ip_str));
+		sprintf(f->peer.str, "[%s]:[%d]", ip_str, ntohs(f->peer.u.in6.sin6_port));
+	}
+	else{
+		cfd = socket(AF_INET, SOCK_DGRAM, 0);
+		addr_len = sizeof(struct sockaddr_in);
+		msg->len = recvfrom(fd, msg->data, sizeof(msg->data), 0,
+				(struct sockaddr*)&src_in4, &addr_len);
+		dst_addr = (struct sockaddr*)&f->me.u.in4;
+		src_addr = (struct sockaddr*)&src_in4;
+		memcpy(&f->peer.u.in4, &src_in4, sizeof(src_in4));
+		f->peer.is_ipv6 = 0;
+		sprintf(f->peer.str, "[%s]:[%d]",inet_ntoa(src_in4.sin_addr), ntohs(src_in4.sin_port) );
+	}
 
-    /*bind, connect fd*/
-    cfd = socket(src_addr.sin_family, SOCK_DGRAM, 0);
-    if (cfd < 0) {
-        printf("Err: creating connect_fd faild\n");
-        return -1;
-    }
+	if (cfd < 0) {
+		printf("Err: creating connect_fd faild\n");
+		return -1;
+	}
+
+	printf("Info: a new QC connection from %s\n", f->peer.str);
+	if (msg->len < 0) {
+		printf("Err: read data on listen fd failed.\n");
+		close(cfd);
+		return -1;
+	}
+
+
     if (setsockopt(cfd, SOL_SOCKET, SO_REUSEADDR, &one_flag, sizeof(one_flag)) < 0
-            || bind(cfd, (struct sockaddr *)&dst_addr, sizeof(struct sockaddr)) < 0
-            || connect(cfd, (struct sockaddr*)&src_addr, sizeof(struct sockaddr)) < 0) {
+            || bind(cfd, dst_addr, addr_len) < 0
+            || connect(cfd, src_addr, addr_len) < 0) {
         printf("Err: connecting to connect_fd %d failed\n", cfd);
         close(cfd);
         goto failed;
@@ -281,17 +345,11 @@ int qc_proxy_recv_from_lfd(int fd, int efd, msg_t** r_msg)
         printf("Err: add connect fd into epoll_fd failed \n");
         return -1;
     }
+    f->fd = cfd;
 
-    /*alloc session*/
-    sess = malloc(sizeof(sess_t));
-    conn = &sess->front;
-    memcpy(&conn->peer_addr, &src_addr, sizeof(src_addr));
-    memcpy(&conn->me_addr, &dst_addr, sizeof(dst_addr));
-    printf("Info setting front  %p peer addr %s:%d \n",
-            conn,
-            inet_ntoa(conn->peer_addr.sin_addr), ntohs(conn->peer_addr.sin_port));
-    conn->fd = cfd;
-    conn->sess = sess;
+    printf("Info setting front  %p  addr %s <-->%s \n",
+            f, f->me.str, f->peer.str
+            );
     sess->back1.fd = -1;
     sess->back2.fd = -1;
 
@@ -332,8 +390,16 @@ int qc_proxy_conn_to_back(msg_t *msg, int efd)
         return -1;
     }
 
+    qc_proxy_set_addr(&conn->peer, REAL_SERV_ADDR);
+
     //new backend socket
-    sockfd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+	if (qproxy_conf.sip_type) {
+		sockfd = socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP);
+	}
+	else{
+		sockfd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+	}
+
     if (sockfd < 0) {
         printf("Err: creating backend socket\n");
         qc_proxy_free(msg, efd);
@@ -344,119 +410,169 @@ int qc_proxy_conn_to_back(msg_t *msg, int efd)
     qc_proxy_mod_fd_into_efd(sockfd, efd, 0);
     printf("Info: creating backend socket successfully\n");
 
-    qc_proxy_set_addr(&conn->peer_addr, REAL_SERV_ADDR);
     conn->fd = sockfd;
 
     msg->back_ready = 1;
     if (msg->mgrt == 1) {
         msg->mgrt = 2;
-#if 0
+#if 1
     sess_t *s = msg->sess;
     conn_t *f = &s->front;
     conn_t *b1 = &s->back1;
     conn_t *b2 = &s->back2;
-    printf("----00000000000000 msg %p sess %p front %p[%d %s:%d] ============  back %p[%d->%d %s:%d]\n",
+    printf("----00000000000000 msg %p sess %p front %p %d %s ============  back %p[%d->%d] %s\n",
             msg, s, f, f->fd,
-            inet_ntoa(f->peer_addr.sin_addr), ntohs(f->peer_addr.sin_port),
+            f->peer.str,
             b1, b1->fd, b2->fd,
-            inet_ntoa(b2->peer_addr.sin_addr), ntohs(b2->peer_addr.sin_port)
-          );
+			conn->peer.str);
 #endif
     }
 
     return 0;
 }
 
-int qc_proxy_recv_from_peer(int fd, msg_t *msg, int efd)
+static int qc_proxy_recv_from_backend(int fd, msg_t *msg, int efd)
 {
-    struct sockaddr_in src_addr;
-    int client_struct_length = sizeof(src_addr);
     sess_t *sess = msg->sess;
-    conn_t *front = &sess->front;
     conn_t *b1 = &sess->back1;
     conn_t *b2 = &sess->back2;
+	conn_t *end = NULL;
+	end = (b1->fd == fd) ? b1 : b2;
+	char buf[128] = {0};
 
-    if (!msg)
-        return 0;
+	memset(msg->data, '\0', MSG_DATA_SIZE);
+	msg->dir = DIR_S2C;
+	msg->len = recv(fd, msg->data, MSG_DATA_SIZE, 0);
+	if (msg->len < 0) {
+		qc_proxy_free(msg, efd);
+		printf("Err: read data on connect fd failed.\n");
+		return -1;
+	}
+	if (msg->len == 0) {
+		qc_proxy_mod_fd_into_efd(fd, efd, 1);
+		printf("Info: close backend fd %d, b1.fd %d \n", fd, b1->fd);
+		qc_proxy_free(msg, efd);
+		return -1;
+	}
 
-    memset(msg->data, '\0', MSG_DATA_SIZE);
+	char *ptr = msg->data;
+	if (!(*ptr & 0x80)) {
+		if (msg->mgrt == 0) {
+			printf("Info: handshake done from QC server\n");
+			msg->mgrt = 1;
+		}
+		else
+			msg->mgrt = 2;
+	}
 
-    //read data on listen fd
-    msg->len = recvfrom(fd, msg->data, sizeof(msg->data), 0,
-         (struct sockaddr*)&src_addr, &client_struct_length);
-    if (msg->len <= 0) {
-        qc_proxy_free(msg, efd);
-        printf("Err: read data on connect fd failed.\n");
-        return -1;
-    }
 
-    //if (src_addr.sin_port == b1->peer_addr.sin_port) {
-    if(fd == b1->fd || fd == b2->fd) {
-        /*from QUIC Server*/
-        msg->dir = DIR_S2C;
-        if (msg->len == 0) {
-            qc_proxy_mod_fd_into_efd(fd, efd, 1);
-            printf("Info: close backend fd %d, b1.fd %d \n", fd, b1->fd);
-        }
-        char *ptr = msg->data;
-        if (!(*ptr & 0x80)) {
-            if (msg->mgrt == 0) {
-                printf("Info: handshake done from QC server\n");
-                msg->mgrt = 1;
-            }
-            else
-                msg->mgrt = 2;
-        }
-    } else {
-        /*from QUIC Client*/
-        msg->dir = DIR_C2S;
-        if (msg->len == 0) {
-            printf("Info: msglen is 0, close all session\n");
-        }
-        unsigned char *ptr = msg->data;
-        if ( !(*ptr & 0x80)) {
-            if (msg->mgrt == 1) {
-                printf("Info: %s changing backend ---->>>>\n",
-                        (msg->dir == DIR_S2C) ? "<<<S2C":">>>C2S"
-                      );
-                msg->back_ready = 0;
-            }
-        }
-    }
-    printf("Info: %s read data from fd %d saddr %s:%d\n",
+    printf("Info: %s read data from fd %d saddr %s\n",
             (msg->dir == DIR_S2C) ? "<<<S2C":">>>C2S",
-            fd, inet_ntoa(src_addr.sin_addr), ntohs(src_addr.sin_port));
-    return 0;
+            fd, end->peer.str);
+	return 0;
+
+}
+
+ /*from QUIC Client*/
+static int qc_proxy_recv_from_front(int fd, msg_t *msg, int efd)
+{
+    sess_t *sess = msg->sess;
+    conn_t *end = &sess->front;
+    memset(msg->data, '\0', MSG_DATA_SIZE);
+	char buf[128] = {0};
+
+	msg->dir = DIR_C2S;
+	msg->len = recv(fd, msg->data, MSG_DATA_SIZE, 0);
+	if (msg->len <= 0) {
+		qc_proxy_free(msg, efd);
+		printf("Err: read data on connect fd failed.\n");
+		return -1;
+	}
+
+	unsigned char *ptr = msg->data;
+	if ( !(*ptr & 0x80)) {
+		if (msg->mgrt == 1) {
+			printf("Info: %s changing backend ---->>>>\n",
+					(msg->dir == DIR_S2C) ? "<<<S2C":">>>C2S"
+				  );
+			msg->back_ready = 0;
+		}
+	}
+
+	if(end->peer.is_ipv6) {
+		struct sockaddr_in6 *peer = (struct sockaddr_in6*)&(end->peer.u.in6);
+		strcpy(buf, "[");
+		inet_ntop(AF_INET6, &(peer->sin6_addr), buf+strlen(buf), sizeof(buf)-strlen(buf));
+		sprintf(buf+strlen(buf), "]:[%d]", ntohs(peer->sin6_port));
+	} else {
+		struct sockaddr_in *peer = (struct sockaddr_in *) &(end->peer.u.in4);
+		sprintf(buf, "[%s]:[%d]", 
+				inet_ntoa(peer->sin_addr), ntohs(peer->sin_port));
+	}
+
+    printf("Info: %s read data from fd %d saddr %s \n",
+            (msg->dir == DIR_S2C) ? "<<<S2C":">>>C2S",
+            fd, end->peer.str);
+	return 0;
+}
+
+int qc_proxy_recv_from_peer(int fd, msg_t *msg, int efd)
+{
+	if (!msg)
+		return 0;
+
+    sess_t *sess = msg->sess;
+	conn_t *b1 = &sess->back1;
+	conn_t *b2 = &sess->back2;
+
+
+	if(fd == b1->fd || fd == b2->fd) {
+		return qc_proxy_recv_from_backend(fd, msg, efd);
+	} else {
+		return qc_proxy_recv_from_front(fd, msg, efd);
+
+	}
+	return 0;
 }
 
 int qc_proxy_send_to_peer(msg_t *msg, int efd)
 {
-    sess_t *sess = msg->sess;
-    conn_t *end = NULL;
+	struct sockaddr* dst;
+	sess_t *sess = msg->sess;
+	conn_t *end = NULL;
+	size_t addr_len = 0;
 
-    if (!msg)
+	if (!msg)
         return 0;
 
     if (msg->dir == DIR_S2C) {
-        end = &sess->front;
-    }
-    else if(msg->mgrt == 2) {
-        end = &sess->back2;
-    } else {
-        end = &sess->back1;
-    }
+		/*send to front*/
+		end = &sess->front;
+	} else {
+		/*send to backend*/
+		if(msg->mgrt == 2) {
+			end = &sess->back2;
+		} else {
+			end = &sess->back1;
+		}
+
+		qc_proxy_set_addr(&end->peer, REAL_SERV_ADDR);
+	}
+
+	addr_len = end->peer.is_ipv6 ? sizeof(struct sockaddr_in6) : sizeof(struct sockaddr_in);;
+	dst = end->peer.is_ipv6 ?  (struct sockaddr*)&(end->peer.u.in6) : (struct sockaddr*)&(end->peer.u.in4); 
+
 
     if (sendto(end->fd, msg->data, msg->len, 0,
-         (struct sockaddr*)&(end->peer_addr), sizeof(struct sockaddr_in)) < 0) {
-        printf("Err: %s send data to %s:%d failed \n",
-                (msg->dir == DIR_S2C) ? "<<<S2C" : ">>>C2S",
-                inet_ntoa(end->peer_addr.sin_addr), ntohs(end->peer_addr.sin_port));
+		 dst, addr_len) < 0) {
+        printf("Err: %s send data to %s addr_len %ld failed \n",
+                (msg->dir == DIR_S2C) ? "<<<S2C" : ">>>C2S", end->peer.str, addr_len);
         qc_proxy_free(msg, efd);
         return -1;
     }
-    printf("Info: %s send data to   fd %d daddr %s:%d \n", 
+    printf("Info: %s send data to fd %d daddr %s \n", 
             (msg->dir == DIR_S2C) ? "<<<S2C" : ">>>C2S", end->fd,
-            inet_ntoa(end->peer_addr.sin_addr), ntohs(end->peer_addr.sin_port));
+			end->peer.str);
 
     return 0;
 }

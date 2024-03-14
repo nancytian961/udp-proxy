@@ -41,9 +41,20 @@ typedef struct _msg {
     short back_ready;
 }msg_t;
 
+typedef union{
+	struct sockaddr_in in4;
+	struct sockaddr_in6 in6;
+}u_addr;
+
+typedef struct _addr_info{
+	u_addr u;
+	char str[64];
+	int is_ipv6;
+}addr_info;
+
 typedef struct _conn {
-    struct sockaddr_in me_addr;
-    struct sockaddr_in peer_addr;
+    addr_info me;
+    addr_info peer;
     int fd;
     void *sess;  //
 }conn_t;

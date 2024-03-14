@@ -6,10 +6,12 @@
 
 static int ip_version(char *ip_str)
 {
-	if (!strstr(ip_str, ":"))
-		return 4;
-	else 
+	if (strstr(ip_str, ":"))
 		return 6;
+	else if(strstr(ip_str, "."))
+		return 4;
+	else
+		return -1;
 }
 
 int qc_proxy_parse_laddr(void *conf, char *arg)
